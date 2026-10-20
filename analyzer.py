@@ -4,17 +4,18 @@ from scipy.signal import find_peaks
 
 class Analyzer:
   # initialization
-  def __init__(self, v_low=0.90, v_high=1.05, loading_limit_pct=100.0, fn=60.0, pfr_db_hz=0.0):
+  def __init__(self, v_low=0.90, v_high=1.05, loading_limit_pct=100.0, fn=60.0, pfr_db_hz=0.0, icr_pu=1.0):
     self.v_low = v_low                      # lower edge of the continuous operation region (pu)
-    self.v_high = v_high                    # upper edge of the continuous operation region (pu)
+    self.v_high = v_high                    # upper edge of the continuous operation region (pu), the 1.05 setup only applies to system with voltage lower than 500 kV
     self.loading_limit_pct = loading_limit_pct
     self.fn = fn                            # rated frequency (Hz)
     self.pfr_db_hz = pfr_db_hz              # plant PFR deadband (Hz); IEEE 2800 default is 0.06% * fn
+    self.icr_pu = icr_pu   # ICR in pu of the apparent-power base S_base (ICR_MW / S_base_MVA)
     # Measurement levels, IEEE 2800-2022 Cl.7.2.2.1 / Cl.7.3.2 (limits live in the comparator)
     # (direction, level, sliding window in s, tag)
     self.lvrt_bands = [("below", 0.90, 10.0, "V<0.90"), ("below", 0.70, 10.0, "V<0.70"),
                      ("below", 0.50, 10.0, "V<0.50"), ("below", 0.25, 10.0, "V<0.25")]
-    self.hvrt_bands = [("above", 1.10, 10.0, "V>1.10")]
+    self.hvrt_bands = [("above", 1.10, 10.0, "V>1.10"),("above", 1.05, 3600.0, "V>1.05")]
     self.freq_bands = [("below", 58.8, 600.0, "f<58.8"), ("above", 61.2, 600.0, "f>61.2")]
 
   '''
@@ -210,6 +211,11 @@ class Analyzer:
         else:
             hit = x > level                     # samples above the level
         c = np.cumsum(dt * hit)               # running cumulative time beyond the level from the beginning
+        # Look up the computed cumulated time in the previous step
+        # t - window indicates the time to look up
+        # t, c: known discrete curve
+        # c_start: c(t-window)
+        # Obtain the time voltage violate the threshold in each 10s side window  
         c_start = np.interp(t - window, t, c, left=0.0)   # cumulative time at each window start (0 before the record)
         results.append({"tag": tag, "dwell_s": float(np.max(c - c_start))})   # worst window
     return results
@@ -217,7 +223,15 @@ class Analyzer:
   def _detect_fault_window(self, v,t):
     v = np.asarray(v, dtype=float)  # float array; no copy if it already is one
     t = np.asarray(t, dtype=float)
-    idx = np.where((v < self.v_low) | (v > self.v_high))[0]   # outside the continuous operation region (Cl.7.2.2.4)
+    idx = np.where((v < self.v_low) | (v > self.v_high))[0]   # outside the continuous operation region (Cl.7.2.2.4), tuple structure
+    '''
+    Example code
+    v = np.array([1.00, 0.85, 0.60, 0.95, 1.08])
+    mask = (v < 0.90) | (v > 1.05)    # array([False,  True,  True, False,  True])
+
+    np.where(mask)       # (array([1, 2, 4]),)   ← tuple, note the trailing comma
+    np.where(mask)[0]    #  array([1, 2, 4])     ← the index array itself
+    '''
     if len(idx) == 0:
         t_start, t_end = None, None           # no fault detected
     else:
@@ -233,14 +247,14 @@ class Analyzer:
     t = np.asarray(t, dtype=float)
     m_pre = (t >= t_start - 0.5) & (t < t_start)
     if not np.any(m_pre):
-        return None, None, None
+        return None, None, None            # data before the fault lacks
     p_pre = float(np.mean(p[m_pre]))       # power before the disturbance
     arr = t[(t > t_end) & (v >= self.v_low) & (v <= self.v_high)]   # voltage back in the continuous region
     if len(arr) == 0:                       # voltage never recovers
         return None, p_pre, None
-    t_vrec = float(arr[0])
+    t_vrec = float(arr[0])     
     p_dip = float(np.min(p[(t >= t_start) & (t <= t_vrec)]))      # lowest power during the disturbance
-    band = max(0.025 * (p_pre - p_dip), 0.005)                     # Table 8 settling band (p in pu of ICR)
+    band = max(0.025 * (p_pre - p_dip), 0.005*self.icr_pu)        # Table 8 settling band (p in pu of ICR)
     arr2 = t[(t >= t_vrec) & (p >= p_pre - band)]                  # power back inside the band
     if len(arr2) == 0:                      # active power never recovers
         return None, p_pre, p_dip
@@ -250,17 +264,25 @@ class Analyzer:
     """
     Standard: NERC PRC-029-1 - no-trip region  
     """
-    if t_start is None:
-            return 0
-    mask = (t >= t_start) & (t <= t_end) & (v >= 0.25)
-    idx = np.where((p < 0.05) & mask)[0]
-    if len(idx) == 0:                # No low active power sample, return 0
-        return 0
-    splits = np.where(np.diff(idx) > 1)[0]   # Split points
-    runs = np.split(idx, splits + 1)         # Cut to continuous segments
-    dt = np.diff(t, prepend=t[0])
-    longest = max(float(np.sum(dt[r])) for r in runs)
-    return 1 if longest >= 0.02 else 0
+    p = np.asarray(p, dtype=float)  # float array; no copy if it already is one
+    v = np.asarray(v, dtype=float)
+    t = np.asarray(t, dtype=float)
+    if q is None:
+       i_mag = np.abs(p)
+    else:
+      q = np.asarray(q, dtype=float)
+      i_mag = np.sqrt(p**2 + q**2) / np.maximum(v, 1e-3)
+    mandatory = ((v >= 0.10) & (v < self.v_low)) | ((v > 1.10) & (v <= 1.20))
+    blocked = (t >= t_start) & (t <= t_end) & mandatory & (i_mag < 0.05) # make judgement based on current
+    dt = np.diff(t, append=t[-1])           # time each sample stands for
+    longest, run = 0.0, 0.0
+    for k in range(len(t)):
+      if blocked[k]:
+        run += dt[k]                        # extend the current blocked run
+        longest = max(longest, run)
+      else:
+        run = 0.0                           # run ends
+    return longest
 
   def analyze_fault(self, v, t, p, f):
     """
