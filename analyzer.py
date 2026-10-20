@@ -23,7 +23,7 @@ class Analyzer:
   '''
   def _max_rocof(self, f, t, T = 0.1):
     '''
-    Maximum rate of change of frequency absolute value, based on IEEE 2800-2022 Cl7.3 |RoCoF| ≤ 5.0 Hz/s, NERC PRC-029-1
+    Maximum rate of change of frequency absolute value, based on IEEE 2800-2022 Cl7.3 |RoCoF| ≤ 5.0 Hz/s, NERC PRC-029-1, ramp up ability measurement
     '''
     t = np.asarray(t, dtype=float)
     f = np.asarray(f, dtype=float)
