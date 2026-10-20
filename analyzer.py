@@ -25,6 +25,8 @@ class Analyzer:
     '''
     Maximum rate of change of frequency absolute value, based on IEEE 2800-2022 Cl7.3 |RoCoF| ≤ 5.0 Hz/s, NERC PRC-029-1
     '''
+    t = np.asarray(t, dtype=float)
+    f = np.asarray(f, dtype=float)
     # Frequency at each window start; NaN if before the record
     # Array-based operation
     f_start = np.interp(t-T, t, f, left = np.nan)
@@ -38,6 +40,9 @@ class Analyzer:
     H = -fn * ΔE/(2.Δf) from the rotor equation, 2H/fn·d(Δf)/dt = -ΔP
     where ΔE is the change in kinetic energy, Δf is the change in frequency, fn is the rated frequency, p(t) is the power injection, and p0 is the initial power injection.
     '''
+    f = np.asarray(f, dtype=float)
+    t = np.asarray(t, dtype=float)
+    p = np.asarray(p, dtype=float)
     # Acquire at least 0.2s time window to get the steady state data
     m_pre = (t >= t0 - 0.2) & (t < t0)
     p_pre = float(np.mean(p[m_pre]))        # Average power before the disturbance
@@ -46,16 +51,18 @@ class Analyzer:
     # Inject increment energy to the window: ΔE = ∫(P − P_pre)dt（trapezoidal method）
     dE = float(trapezoid(p[m_win] - p_pre, t[m_win]))
     # Frequency line fitting, |Δf| = |slope|×(t1−t0)
-    df = abs(np.polyfit(t[m_win], f[m_win], 1)[0]) * (t1 - t0)
-    if df < 1e-6:                           # Zero frequency change, cannot calculate inertia
+    df = np.polyfit(t[m_win], f[m_win], 1)[0] * (t1 - t0)
+    if abs(df) < 1e-6:                           # Zero frequency change, cannot calculate inertia
         return None
     return -self.fn * dE / (2.0 * df)
 
   def _phase_jump_dp(self, p,t,t_jump):
     '''
-    Calculate the active power change at the 1/3 cycle after phase jump 
+    Calculate the active power change at 1 and 3 cycles after the phase jump
     DOE UNIFI GFM spec v3 §2.2.5, GFM inject/absorb power to counteract the phase angle change
     '''
+    t = np.asarray(t, dtype=float)
+    p = np.asarray(p, dtype=float)
     cyc = 1.0 / self.fn                     # 1 cycle count（s）
     p_pre = float(np.mean(p[(t >= t_jump - 0.1) & (t < t_jump)]))
 
@@ -68,6 +75,9 @@ class Analyzer:
     '''
     Quasi steady state droop calculation based on FERC Order 842 - all newly built generation units should be less than or equal to 5%, IEEE 2800
     '''
+    f = np.asarray(f, dtype=float)
+    t = np.asarray(t, dtype=float)
+    p = np.asarray(p, dtype=float)
     f_pre = float(np.mean(f[(t >= t_pre0) & (t <= t_pre1)]))
     f_post = float(np.mean(f[(t >= t_post0) & (t <= t_post1)]))
     p_pre = float(np.mean(p[(t >= t_pre0) & (t <= t_pre1)]))
@@ -80,6 +90,15 @@ class Analyzer:
     # Compute an effective frequency deviation based on the 6.1.1 Table 6 equation with dead zone 
     df_eff = np.sign(df) * max(abs(df)-self.pfr_db_hz, 0.0)
     return (df_eff/ self.fn) / dp * 100.0 # Regulate picking positive droop value
+
+  def _freq_extremes(self, f, t, t0):
+    '''
+    Frequency nadir (lowest) and zenith (highest) at or after the event start t0
+    '''
+    f = np.asarray(f, dtype=float)  # float array; no copy if it already is one
+    t = np.asarray(t, dtype=float)
+    seg = f[t >= t0]                        # frequency after the event starts
+    return float(np.min(seg)), float(np.max(seg))
 
   def analyze_key_parameters(self, f, t, p, ev):
     """Assemble key parameters.
@@ -94,16 +113,7 @@ class Analyzer:
         pfr_post (tuple)     - post-disturbance quasi-steady window (t0, t1)
         p_rated (float)      - ICR, the continuous ACTIVE-power rating (IEEE 2800 Cl.3), in the unit of p.p is normally in pu of the apparent-power base S_base (MVA), so p_rated = ICR_MW / S_base_MVA (e.g. 90 MW / 100 MVA = 0.9). 
     """
-    f = np.array(f, dtype=float)
-    t = np.array(t, dtype=float)
-    p = np.array(p, dtype=float)
-    m = t >= ev['freq_t0']
-    seg, tseg = f[m], t[m]
-    i_min, i_max = int(np.argmin(seg)), int(np.argmax(seg))
-    # nadir: minimum value of the frequency during the frequency event
-    nadir, t_nadir = float(seg[i_min]), float(tseg[i_min])
-    # zenith: maximum value of the frequency during the frequency event
-    zenith = float(seg[i_max])
+    nadir, zenith = self._freq_extremes(f, t, ev['freq_t0'])
 
     rocof_max, _ = self._max_rocof(f, t)
     H = self._effective_inertia(f, p, t, ev["inertia_t0"], ev["inertia_t1"])
@@ -119,7 +129,7 @@ class Analyzer:
       "rocof_ride_through_Hz_per_s": {"value": rocof_max, "unit": "Hz/s", "desc_zh": "Max |RoCoF|"},
       "unifi_equiv_inertia_H_s": {"value": H, "unit": "s", "desc_zh": "Equivalent inertia constant"},
       "unifi_phase_jump_test_active_power_pu": {"value": dP1, "unit": "pu", "desc_zh": "Active power variation at first cycle after the phase angle jump"},
-    "unifi_phase_jump_test_active_power_pu3": {"value": dP3, "unit": "pu", "desc_zh": "Active power variation at third cycle after the phase angle jump"},
+    "unifi_phase_jump_test_active_power_3cyc_pu": {"value": dP3, "unit": "pu", "desc_zh": "Active power variation at third cycle after the phase angle jump"},
       "pfr_droop_percent": {"value": droop_percent, "unit": "%", "desc_zh": "Primary frequency modulation droop coefficient"},
     }
     return out
@@ -132,6 +142,8 @@ class Analyzer:
     Load fluctuation intensity: max |dP/dt|. Ramp rate
     NERC Level 3 warning —— GW level computation load operation
     """
+    p_load = np.asarray(p_load, dtype = float)
+    t = np.asarray(t, dtype = float)
     # Take max absolute value and corresponding time after numerical differentiation
     raw = np.gradient(p_load, t)
     i_max = np.argmax(np.abs(raw))
@@ -157,7 +169,9 @@ class Analyzer:
     # 3. Settling value
     x_final = np.mean(x[t >= t[-1] - 1.0])  # settled value: mean of the last 1 s
     # 4. Remove settled value
-    y = x_s - x_final  # oscillation around the settled value
+    step = x_final - x[0]                   # size of the step response (signed)
+    sgn = 1.0 if step >= 0 else -1.0        # direction of the step
+    y = (x_s - x_final) * sgn               # flip a step-down response so the first overshoot is positive  
     # 5. Find peaks
     thr = max(5 * noise, 1e-9) # A real peak stands 5 sigma above the noise, and emphasize the 5 sigma threshold locally (prominence)
     idx, _ = find_peaks(y, height=thr, prominence=thr)
@@ -172,7 +186,6 @@ class Analyzer:
         period = float(np.mean(np.diff(t[idx])))
         return float(zeta), period
     if len(idx) == 1:                       # well damped: only one overshoot is visible
-        step = x_final - x[0]                 # size of the step response
         O = y[idx[0]] / abs(step)             # per-unit overshoot
         zeta = -np.log(O) / np.sqrt(np.pi**2 + np.log(O)**2)
         return float(zeta), None
@@ -196,10 +209,9 @@ class Analyzer:
   '''
   def _band_dwell(self, x, t,bands):
     """
-    Standard: IEEE 2800-2022 Cl.7.2.2.3   (LVRT) / Cl.7.2.2.2 (HVRT) / Cl.7.3 (frequency).
-    Each band accumulates dwell time separately; pass iff dwell <= limit per band.
+    Standard: IEEE 2800-2022 Cl.7.2.2.1 / Cl.7.3.2.3.1.
     (Overlaying the trajectory on the envelope geometrically is the WRONG method.)
-    No open-source implementation exists; hand-written with numpy masks.)
+    No open-source implementation exists; hand-written with numpy masks.
     """
     x = np.asarray(x, dtype=float)  # float array; no copy if it already is one
     t = np.asarray(t, dtype=float)
@@ -260,9 +272,9 @@ class Analyzer:
         return None, p_pre, p_dip
     return float(arr2[0]) - t_vrec, p_pre, p_dip
 
-  def _detect_momentary_cessation(self, p, v, t, t_start, t_end):
+  def _detect_momentary_cessation(self, p, v, t, t_start, t_end, q = None):
     """
-    Standard: NERC PRC-029-1 - no-trip region  
+    Standard: IEEE 2800-2022 Cl.7.2.2.3.3  
     """
     p = np.asarray(p, dtype=float)  # float array; no copy if it already is one
     v = np.asarray(v, dtype=float)
@@ -284,37 +296,35 @@ class Analyzer:
         run = 0.0                           # run ends
     return longest
 
-  def analyze_fault(self, v, t, p, f):
+  def analyze_fault(self, v, t, p, f, q=None):
     """
-    Assemble ride-through measures
+    Assemble ride-through measures (measurements only, the comparator applies the limits)
     """
-    v = np.asarray(v, dtype=float); t = np.asarray(t, dtype=float)
-    p = np.asarray(p, dtype=float); f = np.asarray(f, dtype=float)
-    t_start, t_end = self._detect_fault_window(v, t)
+    t_start, t_end = self._detect_fault_window(v, t)          # conversion to arrays happens inside
     if t_start is None:
         return {"fault_detected": {"value": False, "unit": "", "desc_zh": "No fault"}}
     lv = self._band_dwell(v, t, self.lvrt_bands)
     hv = self._band_dwell(v, t, self.hvrt_bands)
     fr = self._band_dwell(f, t, self.freq_bands)
-    key_map = {"V<0.25": "lvrt_dwell_Vlt0p25_s", "0.25-0.50": "lvrt_dwell_0p25leVlt0p50_s",
-               "0.50-0.70": "lvrt_dwell_0p50leVlt0p70_s", "0.70-0.90": "lvrt_dwell_0p70leVlt0p90_s",
-               "1.10-1.20": "hvrt_dwell_1p10Vlt1p20_s",
-               "57.0-58.8": "freq_dwell_57p0leflt58p8_s", "61.2-61.8": "freq_dwell_61p2ltflt61p8_s"}
+    # keys must be EXACTLY the tags in self.*_bands
+    key_map = {"V<0.90": "lvrt_cum_Vlt0p90_s", "V<0.70": "lvrt_cum_Vlt0p70_s",
+               "V<0.50": "lvrt_cum_Vlt0p50_s", "V<0.25": "lvrt_cum_Vlt0p25_s",
+               "V>1.10": "hvrt_cum_Vgt1p10_s", "V>1.05": "hvrt_cum_Vgt1p05_s",
+               "f<58.8": "freq_cum_flt58p8_s", "f>61.2": "freq_cum_fgt61p2_s"}
 
-    def _entry(val, unit, zh): # zh: desc_zh, pre-defined data format protocol 
+    def _entry(val, unit, zh): # zh: desc_zh, pre-defined data format protocol
         return {"value": val, "unit": unit, "desc_zh": zh}
-    
+
     out = {}
     for d in lv + hv + fr:
-        out[key_map[d["tag"]]] = _entry(d["dwell_s"], "s", "Dwell [%s]" % d["tag"])
-    out["ride_through_worst_margin_s"] = _entry(
-        min(d["margin_s"] for d in lv + hv + fr), "s", "Worst ride-through margin")
-    out["lvrt_zero_voltage_duration_wind_s"] = _entry(lv[0]["dwell_s"], "s", "Zero-voltage dwell")
-    out["hvrt_110_120pct_duration_s"] = _entry(hv[0]["dwell_s"], "s", "HVRT dwell")
+        out[key_map[d["tag"]]] = _entry(d["dwell_s"], "s", "Max cumulative time %s in window" % d["tag"])
+    # (old margin / zero-voltage / hvrt_110_120 lines removed: fields no longer exist or duplicate the loop)
     out["fault_voltage_dip_pu"] = _entry(float(np.min(v)), "pu", "Voltage dip")
     out["fault_duration_s"] = _entry(t_end - t_start, "s", "Fault duration")
-    out["active_power_recovery_time_s"] = _entry(
-        self._recovery_time(v, p, t, t_start, t_end), "s", "P recovery time")
-    out["momentary_cessation_detected"] = _entry(
-        self._detect_momentary_cessation(p, v, t, t_start, t_end), "", "Cessation flag")
+    rec, p_pre, p_dip = self._recovery_time(v, p, t, t_start, t_end)   # unpack the 3-tuple
+    out["active_power_recovery_time_s"] = _entry(rec, "s", "P recovery time")
+    out["pre_fault_active_power_pu"] = _entry(p_pre, "pu", "Pre-disturbance active power")
+    out["min_active_power_pu"] = _entry(p_dip, "pu", "Lowest active power during disturbance")
+    out["momentary_cessation_duration_s"] = _entry(
+        self._detect_momentary_cessation(p, v, t, t_start, t_end, q), "s", "Longest current blocking in mandatory region")
     return out
